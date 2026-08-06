@@ -2,3 +2,5 @@ target/
 artifacts/
 *.wasm
 hash.txt
+secret-*.hex
+.contract-*
