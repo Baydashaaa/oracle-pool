@@ -31,7 +31,8 @@ fn owner_querier(owner: &'static str) -> MockQuerier {
     q.update_wasm(move |req| -> QuerierResult {
         match req {
             WasmQuery::Smart { .. } => SystemResult::Ok(ContractResult::Ok(
-                to_json_binary(&serde_json::json!({ "owner": owner })).unwrap(),
+                to_json_binary(&serde_json::json!({ "owner": owner, "approvals": [] }))
+                    .unwrap(),
             )),
             _ => SystemResult::Ok(ContractResult::Err("unexpected".into())),
         }
@@ -43,6 +44,12 @@ macro_rules! deps_with_owner {
     ($owner:expr) => {{
         let mut d = mock_dependencies();
         d.querier = owner_querier($owner);
+        // The pot follows the contract's real balance, so a test that expects
+        // a payout has to fund it. Tests about the shortfall override this.
+        d.querier.update_balance(
+            mock_env().contract.address,
+            vec![cosmwasm_std::coin(1_000_000_000_000u128, DENOM)],
+        );
         d
     }};
 }
@@ -352,4 +359,45 @@ fn entries_after_close_belong_to_the_next_round() {
     let r = round(deps.as_ref(), at(30 * HOUR), 1);
     assert_eq!(r.total_entries, Some(1), "the late mint must not join round 1");
     assert_eq!(r.last_entry_id, Some(1));
+}
+
+/// Entries record what the minter sent, but the burn tax means the contract
+/// receives less. The pot must follow the balance, or the shortfall compounds
+/// until a draw tries to pay out money that is not there.
+#[test]
+fn pot_never_exceeds_the_balance() {
+    use cosmwasm_std::{coin, BankMsg, CosmosMsg};
+
+    let mut deps = deps_with_owner!("alice");
+    // the contract holds 1% less than the entry claims — as on chain
+    deps.querier
+        .update_balance(mock_env().contract.address, vec![coin(24_750_000_000u128, DENOM)]);
+    init(deps.as_mut(), vec![8000], 5);
+    record(deps.as_mut(), at(10), "alice", 1, "common-1");
+    record(deps.as_mut(), at(11), "alice", 4, "rare-1");
+
+    let res = execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw {
+            round_id: 1,
+            secret: secret_of(1),
+        },
+    )
+    .unwrap();
+
+    let sent: u128 = res
+        .messages
+        .iter()
+        .map(|m| match &m.msg {
+            CosmosMsg::Bank(BankMsg::Send { amount, .. }) => amount[0].amount.u128(),
+            _ => 0,
+        })
+        .sum();
+
+    assert!(
+        sent <= 24_750_000_000u128,
+        "paid out {sent} with only 24750000000 on hand"
+    );
 }

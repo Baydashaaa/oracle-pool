@@ -64,7 +64,10 @@ enum Cw721Query {
     },
 }
 
-#[cosmwasm_schema::cw_serde]
+/// Deliberately NOT cw_serde: that implies deny_unknown_fields, and cw721
+/// returns {owner, approvals}. A response type from another contract must
+/// tolerate fields it does not care about.
+#[derive(serde::Deserialize)]
 struct OwnerOfResponse {
     owner: String,
 }
@@ -173,6 +176,20 @@ fn entry_at_index(
     Err(ContractError::Std(StdError::generic_err(
         "ticket index out of range",
     )))
+}
+
+/// Sum of the amounts of entries recorded after `last_id` — money that came in
+/// for a later round and must not be paid out with this one.
+fn reserved_after(store: &dyn Storage, last_id: u64) -> Result<Uint128, ContractError> {
+    let mut total = Uint128::zero();
+    for item in ENTRIES
+        .range(store, Some(Bound::exclusive(last_id)), None, Order::Ascending)
+        .take(MAX_SCAN)
+    {
+        let (_, e) = item?;
+        total += e.amount;
+    }
+    Ok(total)
 }
 
 fn derived_status(round: &Round, now: Timestamp) -> RoundStatus {
@@ -437,7 +454,21 @@ fn execute_draw(
 
     let scan = scan_round(deps.storage, round_id, &round)?;
     let carry = CARRY.load(deps.storage)?;
-    let pot = scan.amount + carry;
+
+    // The pot is reconciled with the real balance, not taken from the entry
+    // amounts alone. A mint records what it sent, but the burn tax shaves 0.5%
+    // off in transit, so the contract always holds slightly less than the sum
+    // of its entries. Trusting the arithmetic would let that gap compound
+    // until a payout exceeds the balance.
+    let balance = deps
+        .querier
+        .query_balance(env.contract.address.clone(), &cfg.denom)?
+        .amount;
+
+    // Money for entries that belong to later rounds is not ours to spend.
+    let reserved = reserved_after(deps.storage, scan.last_entry_id)?;
+    let available = balance.saturating_sub(reserved);
+    let pot = (scan.amount + carry).min(available);
 
     round.first_entry_id = Some(scan.first_entry_id);
     round.entropy = Some(scan.entropy.clone());
@@ -549,7 +580,9 @@ fn execute_draw(
     ROUNDS.save(deps.storage, round_id, &round)?;
 
     NEXT_UNSETTLED_ID.save(deps.storage, &(round_id + 1))?;
-    CARRY.save(deps.storage, &(pot - paid))?;
+    // Derived from what is actually left, so drift is absorbed here rather
+    // than carried into the next round.
+    CARRY.save(deps.storage, &available.saturating_sub(paid))?;
 
     Ok(Response::new()
         .add_messages(msgs)
