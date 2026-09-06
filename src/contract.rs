@@ -298,8 +298,9 @@ pub fn execute(
             close_time,
         } => open_round(deps, env, info, seed_hash, close_time),
         ExecuteMsg::ExecuteDraw { round_id, secret } => {
-            execute_draw(deps, env, info, round_id, secret)
+            execute_draw(deps, env, info, round_id, Some(secret))
         }
+        ExecuteMsg::SettleStale { round_id } => execute_draw(deps, env, info, round_id, None),
         ExecuteMsg::RolloverRound { round_id } => rollover_round(deps, env, round_id),
         ExecuteMsg::UpdateConfig { .. } => update_config(deps, info, msg),
     }
@@ -438,18 +439,37 @@ fn check_settleable(
     Ok(round)
 }
 
+/// `secret = None` is the stale path: the round is settled without a reveal,
+/// which is only allowed once it has gone stale.
 fn execute_draw(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
     round_id: u64,
-    secret: Binary,
+    secret: Option<Binary>,
 ) -> Result<Response, ContractError> {
     let cfg = CONFIG.load(deps.storage)?;
     let mut round = check_settleable(deps.storage, &env, round_id)?;
 
-    if sha256(&[secret.as_slice()]).as_slice() != round.seed_hash.as_slice() {
-        return Err(ContractError::SecretMismatch {});
+    match &secret {
+        Some(s) => {
+            if sha256(&[s.as_slice()]).as_slice() != round.seed_hash.as_slice() {
+                return Err(ContractError::SecretMismatch {});
+            }
+        }
+        None => {
+            // Запасной путь открывается только после того, как раскрыть уже
+            // было пора. Раньше срока он превратил бы себя в способ обойти
+            // фиксацию: посторонний считал бы исход и вызывал бы тот, что
+            // ему выгоднее.
+            let opens_at = round.close_time.plus_seconds(cfg.stale_after_secs);
+            if env.block.time < opens_at {
+                return Err(ContractError::NotStale {
+                    round_id,
+                    secs: cfg.stale_after_secs,
+                });
+            }
+        }
     }
 
     let scan = scan_round(deps.storage, round_id, &round)?;
@@ -474,7 +494,9 @@ fn execute_draw(
     round.entropy = Some(scan.entropy.clone());
     round.total_entries = Some(scan.total_entries);
     round.has_late_entries = scan.has_late_entries;
-    round.secret = Some(secret.clone());
+    // На запасном пути остаётся None - по этому полю раунд, посчитанный без
+    // раскрытия, отличается от обычного и в состоянии, и в зеркале.
+    round.secret = secret.clone();
     round.settled_at = Some(env.block.time);
 
     // Not enough of a round to run: consume nothing, leave the boundary where
@@ -491,11 +513,22 @@ fn execute_draw(
             .add_attribute("pot", pot));
     }
 
-    let result = sha256(&[
-        secret.as_slice(),
-        scan.entropy.as_slice(),
-        &round_id.to_be_bytes(),
-    ]);
+    // Обычный путь берёт раскрытый секрет. Запасной - метку схемы и seed_hash
+    // вместо него: и то, и другое зафиксировано до закрытия приёма, поэтому
+    // исход одинаков при любом моменте вызова и считается публично.
+    let result = match &secret {
+        Some(s) => sha256(&[
+            s.as_slice(),
+            scan.entropy.as_slice(),
+            &round_id.to_be_bytes(),
+        ]),
+        None => sha256(&[
+            b"oracle-pool:stale",
+            scan.entropy.as_slice(),
+            &round_id.to_be_bytes(),
+            round.seed_hash.as_slice(),
+        ]),
+    };
 
     // Distinct winners are picked by minter, not by current owner: the owner
     // costs a query per candidate, the minter is already in storage. Someone
@@ -586,7 +619,10 @@ fn execute_draw(
 
     Ok(Response::new()
         .add_messages(msgs)
-        .add_attribute("action", "execute_draw")
+        .add_attribute(
+            "action",
+            if secret.is_some() { "execute_draw" } else { "settle_stale" },
+        )
         .add_attribute("round_id", round_id.to_string())
         .add_attribute("entries", scan.total_entries.to_string())
         .add_attribute("pot", pot)
@@ -620,6 +656,21 @@ fn rollover_round(deps: DepsMut, env: Env, round_id: u64) -> Result<Response, Co
             round_id,
             secs: cfg.stale_after_secs,
         });
+    }
+
+    // Раунд, который можно разыграть, здесь больше не отменяется: для него
+    // есть SettleStale. Иначе посторонний мог бы обнулить раунд с билетами и
+    // призом, просто дождавшись, пока раскрытие задержится.
+    let scan = scan_round(deps.storage, round_id, &round)?;
+    let carry = CARRY.load(deps.storage)?;
+    let balance = deps
+        .querier
+        .query_balance(env.contract.address.clone(), &cfg.denom)?
+        .amount;
+    let reserved = reserved_after(deps.storage, scan.last_entry_id)?;
+    let pot = (scan.amount + carry).min(balance.saturating_sub(reserved));
+    if scan.total_entries >= cfg.min_entries && pot >= cfg.min_pot {
+        return Err(ContractError::RoundIsDrawable { round_id });
     }
 
     let first = first_entry_of(deps.storage, round_id)?;

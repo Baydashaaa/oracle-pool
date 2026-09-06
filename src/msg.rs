@@ -60,7 +60,29 @@ pub enum ExecuteMsg {
     ExecuteDraw { round_id: u64, secret: Binary },
 
     /// Permissionless, only after close_time + stale_after_secs with no
-    /// reveal. Consumes nothing: the entries belong to the next round instead.
+    /// reveal. Settles the round WITHOUT the secret, from data that was fixed
+    /// when the round closed:
+    ///
+    ///   result = sha256("oracle-pool:stale" || entropy || round_id || seed_hash)
+    ///
+    /// Nothing here can be ground: entropy comes from the minters, round_id
+    /// and seed_hash were published before the round opened. So the outcome is
+    /// the same whenever this is called, and anyone can compute it once the
+    /// round closes. That is the point - withholding the secret no longer
+    /// decides whether the round happens, only which of two public outcomes
+    /// it settles on.
+    ///
+    /// A round settled this way stores no secret, which is how it is told
+    /// apart from a normal draw afterwards.
+    SettleStale { round_id: u64 },
+
+    /// Permissionless, only after close_time + stale_after_secs, and only for
+    /// rounds there is nothing to draw in (below min_entries or min_pot).
+    /// Consumes nothing: the entries belong to the next round instead.
+    ///
+    /// Rounds that COULD be drawn are refused here on purpose. Before, anyone
+    /// could void such a round the moment it went stale - including to deny a
+    /// winner while the reveal was merely late.
     RolloverRound { round_id: u64 },
 
     UpdateConfig {

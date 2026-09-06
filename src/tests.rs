@@ -274,7 +274,8 @@ fn settlement_is_strictly_in_order() {
 fn rollover_needs_the_round_to_be_stale() {
     let mut deps = deps_with_owner!("alice");
     init(deps.as_mut(), vec![8000], 5);
-    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    // Один билет при пороге в пять: разыграть нечего, значит перенос уместен.
+    record(deps.as_mut(), at(10), "alice", 1, "common-1");
 
     let err = execute(
         deps.as_mut(),
@@ -400,4 +401,109 @@ fn pot_never_exceeds_the_balance() {
         sent <= 24_750_000_000u128,
         "paid out {sent} with only 24750000000 on hand"
     );
+}
+
+/// Перенос больше не отменяет раунд, который можно разыграть. Раньше это был
+/// открытый путь для постороннего: дождаться, пока раскрытие задержится, и
+/// обнулить раунд с билетами и призом.
+#[test]
+fn rollover_refuses_a_drawable_round() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 5);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    let err = execute(
+        deps.as_mut(),
+        at(24 * HOUR + 15 * 24 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::RolloverRound { round_id: 1 },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::RoundIsDrawable { round_id: 1 }));
+}
+
+/// Запасной путь открывается только после того, как раскрыть было пора.
+/// Раньше срока он обходил бы фиксацию: посторонний считал бы оба исхода и
+/// вызывал тот, что ему выгоднее.
+#[test]
+fn stale_settlement_needs_the_round_to_be_stale() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    let err = execute(
+        deps.as_mut(),
+        at(25 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::SettleStale { round_id: 1 },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::NotStale { .. }));
+}
+
+/// Главное свойство схемы: момент вызова на исход не влияет. Всё, из чего
+/// считается запасной результат, зафиксировано к закрытию приёма, поэтому
+/// перебирать блоки в поисках удобного ответа бесполезно.
+#[test]
+fn stale_settlement_is_the_same_whenever_it_is_called() {
+    fn settle_at(offset: u64) -> RoundResponse {
+        let mut deps = deps_with_owner!("alice");
+        init(deps.as_mut(), vec![8000], 1);
+        record(deps.as_mut(), at(10), "alice", 3, "common-1");
+        record(deps.as_mut(), at(20), "bob", 2, "common-2");
+        execute(
+            deps.as_mut(),
+            at(offset),
+            mock_info("anyone", &[]),
+            ExecuteMsg::SettleStale { round_id: 1 },
+        )
+        .unwrap();
+        round(deps.as_ref(), at(offset), 1)
+    }
+
+    let early = settle_at(24 * HOUR + 15 * 24 * HOUR);
+    let late = settle_at(24 * HOUR + 40 * 24 * HOUR);
+    assert_eq!(early.result, late.result, "результат не должен зависеть от момента вызова");
+    assert_eq!(early.winner_indexes, late.winner_indexes);
+    assert_eq!(early.status, RoundStatus::Drawn);
+}
+
+/// Раунд, посчитанный без раскрытия, отличим от обычного: секрета в нём нет.
+/// По этому полю его помечает зеркало, а человек видит в истории.
+#[test]
+fn stale_settlement_records_no_secret() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    execute(
+        deps.as_mut(),
+        at(24 * HOUR + 15 * 24 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::SettleStale { round_id: 1 },
+    )
+    .unwrap();
+    let r = round(deps.as_ref(), at(24 * HOUR + 15 * 24 * HOUR), 1);
+    assert_eq!(r.status, RoundStatus::Drawn);
+    assert!(r.secret.is_none(), "запасной расчёт не должен записывать секрет");
+    assert!(r.result.is_some());
+    assert_eq!(r.total_entries, Some(5));
+}
+
+/// Запасной результат не совпадает с обычным - иначе знание секрета давало бы
+/// оператору предсказание обоих исходов как одного.
+#[test]
+fn stale_result_differs_from_the_revealed_one() {
+    fn settle(stale: bool) -> Binary {
+        let mut deps = deps_with_owner!("alice");
+        init(deps.as_mut(), vec![8000], 1);
+        record(deps.as_mut(), at(10), "alice", 3, "common-1");
+        record(deps.as_mut(), at(20), "bob", 2, "common-2");
+        let when = at(24 * HOUR + 15 * 24 * HOUR);
+        let msg = if stale {
+            ExecuteMsg::SettleStale { round_id: 1 }
+        } else {
+            ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) }
+        };
+        execute(deps.as_mut(), when.clone(), mock_info("anyone", &[]), msg).unwrap();
+        round(deps.as_ref(), when, 1).result.unwrap()
+    }
+    assert_ne!(settle(true), settle(false));
 }

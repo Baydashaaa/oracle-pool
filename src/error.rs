@@ -45,6 +45,9 @@ pub enum ContractError {
     #[error("round {round_id} is not stale yet: rollover opens {secs}s after close_time")]
     NotStale { round_id: u64, secs: u64 },
 
+    #[error("round {round_id} has entries and a pot: settle it with SettleStale, not RolloverRound")]
+    RoundIsDrawable { round_id: u64 },
+
     #[error("invalid config: {reason}")]
     InvalidConfig { reason: String },
 }

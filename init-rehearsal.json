@@ -1,0 +1,16 @@
+{
+  "admin": "ADMIN_ADDRESS_HERE",
+  "nft_contract": "terra1ufn6575ta92xmgzrllpf5cguycwd4kyyf5uetw",
+  "denom": "uluna",
+  "treasury": "ADMIN_ADDRESS_HERE",
+  "treasury_bps": 1000,
+  "payout_bps": [
+    8000
+  ],
+  "caller_bps": 10,
+  "min_entries": 1,
+  "min_pot": "0",
+  "stale_after_secs": 300,
+  "first_seed_hash": "wCS3MQiCDg7yAW2hcAfsjt/FpFdq1yba9ESgyhLi0KI=",
+  "first_close_time": "1788723094148430080"
+}
