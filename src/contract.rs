@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::ContractError;
 use crate::msg::{
-    ConfigResponse, EntriesResponse, EntryResponse, ExecuteMsg, InstantiateMsg, MigrateMsg,
-    PotResponse, ProofResponse, QueryMsg, RoundResponse, RoundsResponse,
+    ConfigResponse, EntriesResponse, EntryResponse, ExecuteMsg, FreeEntryItem, InstantiateMsg,
+    MigrateMsg, PotResponse, ProofResponse, QueryMsg, RoundResponse, RoundsResponse,
 };
 use crate::state::{
     Config, Entry, Round, RoundStatus, CARRY, CONFIG, ENTRIES, LAST_ROUND_ID, NEXT_ENTRY_ID,
@@ -25,6 +25,11 @@ const DEFAULT_LIMIT: u32 = 30;
 const MAX_LIMIT: u32 = 100;
 /// Guard on the per-settlement scan. Rounds are days long, not years.
 const MAX_SCAN: usize = 5_000;
+/// Билеты без токена. По этому префиксу приз платится кошельку напрямую,
+/// вместо запроса владельца у CW721 - спрашивать не о чем.
+const FREE_PREFIX: &str = "free:";
+/// Потолок на пачку, чтобы одна транзакция не упёрлась в лимит газа.
+const MAX_FREE_BATCH: usize = 100;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -293,6 +298,7 @@ pub fn execute(
             amount,
             entropy,
         } => record_entry(deps, env, info, token_id, minter, entries, amount, entropy),
+        ExecuteMsg::RecordFreeEntries { entries } => record_free_entries(deps, env, info, entries),
         ExecuteMsg::OpenRound {
             seed_hash,
             close_time,
@@ -354,6 +360,79 @@ fn record_entry(
         .add_attribute("token_id", token_id)
         .add_attribute("entries", entries.to_string())
         .add_attribute("amount", amount))
+}
+
+/// Бесплатные билеты, заработанные вне цепочки. Только админ и только пока
+/// текущий раунд ещё принимает.
+fn record_free_entries(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    items: Vec<FreeEntryItem>,
+) -> Result<Response, ContractError> {
+    let cfg = CONFIG.load(deps.storage)?;
+    if info.sender != cfg.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    if cfg.paused {
+        return Err(ContractError::Paused {});
+    }
+    if items.is_empty() || items.len() > MAX_FREE_BATCH {
+        return Err(ContractError::BadFreeBatch {
+            max: MAX_FREE_BATCH,
+        });
+    }
+
+    // Дверь закрывается вместе с приёмом. После close_time оператор уже знает,
+    // куда указывает результат, поэтому дописывать билеты нельзя - ни поздней
+    // пометкой, ни как-либо ещё.
+    let current_id = LAST_ROUND_ID.load(deps.storage)?;
+    let current = load_round(deps.storage, current_id)?;
+    if env.block.time >= current.close_time {
+        return Err(ContractError::FreeEntriesClosed {
+            round_id: current_id,
+        });
+    }
+
+    let mut id = NEXT_ENTRY_ID.load(deps.storage)?;
+    let first_id = id;
+    let mut tickets_total: u64 = 0;
+
+    for item in items.iter() {
+        if item.tickets == 0 {
+            return Err(ContractError::ZeroEntries {});
+        }
+        let entropy = Binary::from(item.tx_hash.as_bytes());
+        if entropy.is_empty() || entropy.len() > MAX_ENTROPY_BYTES {
+            return Err(ContractError::BadEntropy {
+                max: MAX_ENTROPY_BYTES,
+            });
+        }
+        ENTRIES.save(
+            deps.storage,
+            id,
+            &Entry {
+                token_id: format!("{FREE_PREFIX}{}", item.tx_hash),
+                minter: deps.api.addr_validate(&item.wallet)?,
+                entries: item.tickets,
+                // Денег в пул такой билет не приносит: за него уже заплачено
+                // тем действием, которым он заработан.
+                amount: Uint128::zero(),
+                entropy,
+                recorded_at: env.block.time,
+            },
+        )?;
+        tickets_total += item.tickets as u64;
+        id += 1;
+    }
+    NEXT_ENTRY_ID.save(deps.storage, &id)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "record_free_entries")
+        .add_attribute("round_id", current_id.to_string())
+        .add_attribute("first_entry_id", first_id.to_string())
+        .add_attribute("wallets", items.len().to_string())
+        .add_attribute("tickets", tickets_total.to_string()))
 }
 
 fn open_round(
@@ -574,7 +653,13 @@ fn execute_draw(
     let mut paid = Uint128::zero();
 
     for (i, token_id) in winner_tokens.iter().enumerate() {
-        let owner = token_owner(deps.as_ref(), &cfg.nft_contract, token_id)?;
+        // У бесплатного билета токена нет, спрашивать владельца не у кого:
+        // приз идёт тому кошельку, который билет заработал.
+        let owner = if token_id.starts_with(FREE_PREFIX) {
+            winner_minters[i].clone()
+        } else {
+            token_owner(deps.as_ref(), &cfg.nft_contract, token_id)?
+        };
         let amount = bps(pot, cfg.payout_bps[i]);
         if !amount.is_zero() {
             msgs.push(BankMsg::Send {

@@ -48,6 +48,12 @@ pub enum ContractError {
     #[error("round {round_id} has entries and a pot: settle it with SettleStale, not RolloverRound")]
     RoundIsDrawable { round_id: u64 },
 
+    #[error("round {round_id} is already closed: free entries must be recorded before it closes")]
+    FreeEntriesClosed { round_id: u64 },
+
+    #[error("free entries batch is empty or larger than {max}")]
+    BadFreeBatch { max: usize },
+
     #[error("invalid config: {reason}")]
     InvalidConfig { reason: String },
 }

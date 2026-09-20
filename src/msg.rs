@@ -21,6 +21,16 @@ pub struct InstantiateMsg {
     pub first_close_time: Timestamp,
 }
 
+/// Один бесплатный билет: кошелёк, сколько билетов и хеш транзакции, которой
+/// он заработан. Хеш служит и ссылкой на причину, и энтропией - он существует
+/// раньше, чем билет попадает в контракт, и оператор его не выбирает.
+#[cw_serde]
+pub struct FreeEntryItem {
+    pub wallet: String,
+    pub tickets: u32,
+    pub tx_hash: String,
+}
+
 #[cw_serde]
 pub enum ExecuteMsg {
     /// Called by the NFT contract inside the mint transaction. Not payable:
@@ -35,6 +45,17 @@ pub enum ExecuteMsg {
         /// 32 bytes generated in the minter's browser.
         entropy: Binary,
     },
+
+    /// Admin. Free entries earned off-chain - chat, questions, streaks.
+    ///
+    /// Refused once the current round has closed. Not flagged, refused: after
+    /// close the operator knows the outcome, so adding tickets then would let
+    /// them aim it, and the whole commitment would be for nothing.
+    ///
+    /// These carry no money into the pot. The activities behind them already
+    /// fund it - message and question fees go to the same pool - so they are
+    /// free to the participant, not to the protocol.
+    RecordFreeEntries { entries: Vec<FreeEntryItem> },
 
     /// Admin. Commits the next round.
     ///

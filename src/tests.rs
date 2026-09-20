@@ -6,7 +6,7 @@ use cosmwasm_std::{
 
 use crate::contract::{execute, instantiate, query};
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, RoundResponse};
+use crate::msg::{ExecuteMsg, FreeEntryItem, InstantiateMsg, QueryMsg, RoundResponse};
 use crate::state::RoundStatus;
 
 const NFT: &str = "nft_contract";
@@ -506,4 +506,139 @@ fn stale_result_differs_from_the_revealed_one() {
         round(deps.as_ref(), when, 1).result.unwrap()
     }
     assert_ne!(settle(true), settle(false));
+}
+
+fn free(deps: cosmwasm_std::DepsMut, env: cosmwasm_std::Env, who: &str, wallet: &str, tickets: u32, tx: &str)
+    -> Result<cosmwasm_std::Response, ContractError>
+{
+    execute(
+        deps,
+        env,
+        mock_info(who, &[]),
+        ExecuteMsg::RecordFreeEntries {
+            entries: vec![FreeEntryItem {
+                wallet: wallet.into(),
+                tickets,
+                tx_hash: tx.into(),
+            }],
+        },
+    )
+}
+
+/// Записывать бесплатные билеты может только админ: это единственный вид
+/// билета, который появляется не из оплаченного минта.
+#[test]
+fn free_entries_are_admin_only() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    let err = free(deps.as_mut(), at(10), "someone", "alice", 1, "AABB").unwrap_err();
+    assert!(matches!(err, ContractError::Unauthorized {}));
+}
+
+/// Главная защита. После закрытия приёма оператор уже знает, куда указывает
+/// результат, поэтому дописать билет нельзя - иначе фиксация секрета ничего
+/// не стоит.
+#[test]
+fn free_entries_are_refused_after_close() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    free(deps.as_mut(), at(10), ADMIN, "alice", 2, "AABB").unwrap();
+    let err = free(deps.as_mut(), at(25 * HOUR), ADMIN, "bob", 2, "CCDD").unwrap_err();
+    assert!(matches!(err, ContractError::FreeEntriesClosed { round_id: 1 }));
+}
+
+/// Бесплатный билет считается наравне с остальными и не приносит денег в пул.
+#[test]
+fn free_entries_add_tickets_but_no_pot() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 2, "common-1");
+    free(deps.as_mut(), at(20), ADMIN, "bob", 3, "AABB").unwrap();
+
+    execute(
+        deps.as_mut(),
+        at(25 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+
+    let r = round(deps.as_ref(), at(25 * HOUR), 1);
+    assert_eq!(r.total_entries, Some(5), "2 платных + 3 бесплатных");
+    // В пул попал только оплаченный минт: 25 LUNC за билет, два билета.
+    assert_eq!(r.pot, Some(Uint128::new(50_000_000_000u128)));
+}
+
+/// У бесплатного билета нет токена, поэтому приз должен уйти кошельку,
+/// который его заработал, а не владельцу несуществующего NFT.
+#[test]
+fn a_free_ticket_can_win_and_is_paid_to_its_wallet() {
+    // Заглушка CW721 отвечает "alice" на любой токен. Если бы контракт
+    // спросил владельца для бесплатного билета, победителем стала бы alice -
+    // тест на этом и поймает ошибку.
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    free(deps.as_mut(), at(10), ADMIN, "bob", 5, "AABB").unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        at(25 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+
+    let r = round(deps.as_ref(), at(25 * HOUR), 1);
+    assert_eq!(r.winners, vec!["bob".to_string()], "приз идёт заработавшему кошельку");
+    assert_eq!(r.total_entries, Some(5));
+    assert_eq!(r.pot, Some(Uint128::zero()), "бесплатные билеты денег не приносят");
+    // Пул пустой, поэтому и переводов быть не должно.
+    assert!(res.messages.is_empty());
+}
+
+/// Пачка пишется целиком и одним заходом.
+#[test]
+fn free_entries_accept_a_batch() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::RecordFreeEntries {
+            entries: vec![
+                FreeEntryItem { wallet: "alice".into(), tickets: 1, tx_hash: "AA".into() },
+                FreeEntryItem { wallet: "bob".into(), tickets: 2, tx_hash: "BB".into() },
+                FreeEntryItem { wallet: "carol".into(), tickets: 3, tx_hash: "CC".into() },
+            ],
+        },
+    )
+    .unwrap();
+    execute(
+        deps.as_mut(),
+        at(25 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+    let r = round(deps.as_ref(), at(25 * HOUR), 1);
+    assert_eq!(r.total_entries, Some(6));
+}
+
+/// Пустая пачка и ноль билетов - ошибка, а не тихо принятая запись.
+#[test]
+fn free_entries_reject_empty_input() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    let err = execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::RecordFreeEntries { entries: vec![] },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::BadFreeBatch { .. }));
+
+    let err = free(deps.as_mut(), at(10), ADMIN, "alice", 0, "AABB").unwrap_err();
+    assert!(matches!(err, ContractError::ZeroEntries {}));
 }
