@@ -585,6 +585,15 @@ fn execute_draw(
         round.last_entry_id = Some(scan.first_entry_id - 1);
         ROUNDS.save(deps.storage, round_id, &round)?;
         NEXT_UNSETTLED_ID.save(deps.storage, &(round_id + 1))?;
+        // Деньги, пришедшие переводом, подбираются и здесь, тем же способом,
+        // что и после выплаты. Без этого получается замкнутый круг: подбор
+        // происходит при выплате, а выплаты нет, потому что пот не дотягивает
+        // до min_pot - ровно из-за неподобранных денег.
+        //
+        // Сумма входов вычитается: пропуск их не расходует, они придут в
+        // следующий раунд вместе со своими деньгами, и иначе она посчиталась
+        // бы дважды - и в carry, и снова в pending.
+        CARRY.save(deps.storage, &available.saturating_sub(scan.amount))?;
         return Ok(Response::new()
             .add_attribute("action", "skip_round")
             .add_attribute("round_id", round_id.to_string())
@@ -753,7 +762,8 @@ fn rollover_round(deps: DepsMut, env: Env, round_id: u64) -> Result<Response, Co
         .query_balance(env.contract.address.clone(), &cfg.denom)?
         .amount;
     let reserved = reserved_after(deps.storage, scan.last_entry_id)?;
-    let pot = (scan.amount + carry).min(balance.saturating_sub(reserved));
+    let available = balance.saturating_sub(reserved);
+    let pot = (scan.amount + carry).min(available);
     if scan.total_entries >= cfg.min_entries && pot >= cfg.min_pot {
         return Err(ContractError::RoundIsDrawable { round_id });
     }
@@ -765,6 +775,9 @@ fn rollover_round(deps: DepsMut, env: Env, round_id: u64) -> Result<Response, Co
     round.settled_at = Some(env.block.time);
     ROUNDS.save(deps.storage, round_id, &round)?;
     NEXT_UNSETTLED_ID.save(deps.storage, &(round_id + 1))?;
+    // Тот же подбор, что и при пропуске: отмена раунда не должна оставлять
+    // деньги вне пота.
+    CARRY.save(deps.storage, &available.saturating_sub(scan.amount))?;
 
     Ok(Response::new()
         .add_attribute("action", "rollover_round")

@@ -4,3 +4,4 @@ artifacts/
 hash.txt
 secret-*.hex
 .contract-*
+.wrangler/

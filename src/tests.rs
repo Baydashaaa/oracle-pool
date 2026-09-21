@@ -6,7 +6,9 @@ use cosmwasm_std::{
 
 use crate::contract::{execute, instantiate, query};
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, FreeEntryItem, InstantiateMsg, QueryMsg, RoundResponse};
+use crate::msg::{
+    ExecuteMsg, FreeEntryItem, InstantiateMsg, PotResponse, QueryMsg, RoundResponse,
+};
 use crate::state::RoundStatus;
 
 const NFT: &str = "nft_contract";
@@ -641,4 +643,147 @@ fn free_entries_reject_empty_input() {
 
     let err = free(deps.as_mut(), at(10), ADMIN, "alice", 0, "AABB").unwrap_err();
     assert!(matches!(err, ContractError::ZeroEntries {}));
+}
+
+
+fn pot(deps: cosmwasm_std::Deps, env: cosmwasm_std::Env) -> PotResponse {
+    from_json(query(deps, env, QueryMsg::Pot {}).unwrap()).unwrap()
+}
+
+/// Деньги, пришедшие на контракт переводом, в записях входов не видны:
+/// перевод не запускает кода, поэтому RecordEntry для них никто не вызывает.
+/// Подобрать их должен пропуск раунда - иначе они не попадут в приз никогда,
+/// потому что выплата, которая их подбирает, не случится из-за них же.
+#[test]
+fn a_skip_absorbs_money_that_arrived_by_transfer() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 5);
+
+    // 100k на балансе против одного входа на 25k: разница пришла переводом.
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![cosmwasm_std::coin(100_000_000_000u128, DENOM)],
+    );
+    record(deps.as_mut(), at(10), "alice", 1, "common-1");
+
+    let before = pot(deps.as_ref(), at(11));
+    assert_eq!(before.carry, Uint128::zero());
+    assert_eq!(before.pending, Uint128::new(25_000_000_000));
+
+    execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::OpenRound {
+            seed_hash: hash(secret_of(2).as_slice()),
+            close_time: mock_env().block.time.plus_seconds(48 * HOUR),
+        },
+    )
+    .unwrap();
+
+    // Один вход против min_entries = 5, значит раунд пропускается.
+    execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw {
+            round_id: 1,
+            secret: secret_of(1),
+        },
+    )
+    .unwrap();
+
+    let r = round(deps.as_ref(), at(24 * HOUR + 2), 1);
+    assert_eq!(r.status, RoundStatus::Skipped);
+
+    let after = pot(deps.as_ref(), at(24 * HOUR + 2));
+    assert_eq!(
+        after.pending,
+        Uint128::new(25_000_000_000),
+        "вход не израсходован, его деньги остаются в pending"
+    );
+    assert_eq!(
+        after.carry,
+        Uint128::new(75_000_000_000),
+        "переводом пришло 75k, они должны оказаться в carry"
+    );
+    assert_eq!(
+        after.pending + after.carry,
+        after.balance,
+        "после подбора весь баланс участвует в поте, ничего не лежит мимо"
+    );
+}
+
+/// То же самое для отмены раунда: она тоже ничего не выплачивает и тоже не
+/// должна оставлять деньги вне пота.
+#[test]
+fn a_rollover_absorbs_money_that_arrived_by_transfer() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 5);
+
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![cosmwasm_std::coin(100_000_000_000u128, DENOM)],
+    );
+    record(deps.as_mut(), at(10), "alice", 1, "common-1");
+
+    let stale = 24 * HOUR + 14 * 24 * HOUR + 1;
+    execute(
+        deps.as_mut(),
+        at(stale),
+        mock_info("anyone", &[]),
+        ExecuteMsg::RolloverRound { round_id: 1 },
+    )
+    .unwrap();
+
+    let r = round(deps.as_ref(), at(stale + 1), 1);
+    assert_eq!(r.status, RoundStatus::RolledOver);
+
+    let after = pot(deps.as_ref(), at(stale + 1));
+    assert_eq!(after.carry, Uint128::new(75_000_000_000));
+    assert_eq!(after.pending + after.carry, after.balance);
+}
+
+/// Подобранные деньги не должны посчитаться дважды. Вход переезжает в
+/// следующий раунд вместе со своими деньгами, поэтому его сумма в carry
+/// попадать не должна.
+#[test]
+fn absorbing_does_not_double_count_the_entries() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 5);
+
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![cosmwasm_std::coin(100_000_000_000u128, DENOM)],
+    );
+    record(deps.as_mut(), at(10), "alice", 1, "common-1");
+
+    execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::OpenRound {
+            seed_hash: hash(secret_of(2).as_slice()),
+            close_time: mock_env().block.time.plus_seconds(48 * HOUR),
+        },
+    )
+    .unwrap();
+    execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw {
+            round_id: 1,
+            secret: secret_of(1),
+        },
+    )
+    .unwrap();
+
+    let after = pot(deps.as_ref(), at(24 * HOUR + 2));
+    assert!(
+        after.pending + after.carry <= after.balance,
+        "pending + carry = {} против баланса {} - это задвоение",
+        after.pending + after.carry,
+        after.balance
+    );
 }
