@@ -15,6 +15,9 @@ pub struct InstantiateMsg {
     pub min_entries: u64,
     pub min_pot: Uint128,
     pub stale_after_secs: u64,
+    /// Automation key. Omitted - the admin acts as operator too.
+    #[serde(default)]
+    pub operator: Option<String>,
     /// Round 1 is committed here, so entries can never arrive with no
     /// commitment covering them.
     pub first_seed_hash: Binary,
@@ -57,7 +60,12 @@ pub enum ExecuteMsg {
     /// free to the participant, not to the protocol.
     RecordFreeEntries { entries: Vec<FreeEntryItem> },
 
-    /// Admin. Commits the next round.
+    /// Operator. Commits the next round.
+    ///
+    /// The new round must close after the previous round's reveal deadline
+    /// (its close_time + stale_after_secs). That is what makes withholding a
+    /// reveal pointless: at the deadline the next round is still open, so the
+    /// outcome it would roll into is not knowable yet.
     ///
     /// Meant to be called while the current round is still open — that is what
     /// keeps the commitment older than the entries. It is still allowed
@@ -75,39 +83,41 @@ pub enum ExecuteMsg {
     ///   result  = sha256(secret || entropy || round_id)
     ///   index   = u128(result[0..16]) % total_entries
     ///
-    /// There is no reveal deadline on purpose: the outcome is fixed the moment
-    /// the round closes, so a late reveal changes nothing, while a deadline
-    /// would turn a CI outage into a lost round.
+    /// Must happen within stale_after_secs of close_time (the reveal window,
+    /// frozen into the round at open). After that it is refused and the round
+    /// can only be rolled over.
+    ///
+    /// Earlier versions had no deadline, reasoning that the outcome is fixed
+    /// at close. It is - but an open-ended reveal let the secret holder wait
+    /// for the next round to close, compute both outcomes and choose (SEC-03).
+    /// A CI outage longer than the window now costs a rollover, not money:
+    /// the entries and the pot move to the next round intact.
     ExecuteDraw { round_id: u64, secret: Binary },
 
-    /// Permissionless, only after close_time + stale_after_secs with no
-    /// reveal. Settles the round WITHOUT the secret, from data that was fixed
-    /// when the round closed:
+    /// Kept for compatibility with existing callers; identical to
+    /// RolloverRound.
     ///
-    ///   result = sha256("oracle-pool:stale" || entropy || round_id || seed_hash)
-    ///
-    /// Nothing here can be ground: entropy comes from the minters, round_id
-    /// and seed_hash were published before the round opened. So the outcome is
-    /// the same whenever this is called, and anyone can compute it once the
-    /// round closes. That is the point - withholding the secret no longer
-    /// decides whether the round happens, only which of two public outcomes
-    /// it settles on.
-    ///
-    /// A round settled this way stores no secret, which is how it is told
-    /// apart from a normal draw afterwards.
+    /// It used to settle an unrevealed round by a second, public formula. That
+    /// handed the secret holder a choice between two known outcomes - reveal,
+    /// or wait and take the other one (SEC-03). A stale round now rolls over.
     SettleStale { round_id: u64 },
 
-    /// Permissionless, only after close_time + stale_after_secs, and only for
-    /// rounds there is nothing to draw in (below min_entries or min_pot).
-    /// Consumes nothing: the entries belong to the next round instead.
+    /// Permissionless, once the reveal window has closed. Consumes nothing:
+    /// the round's entries and their money move to the next round, which
+    /// draws with its own secret over everything.
     ///
-    /// Rounds that COULD be drawn are refused here on purpose. Before, anyone
-    /// could void such a round the moment it went stale - including to deny a
-    /// winner while the reveal was merely late.
+    /// Drawable rounds are rolled over too. That used to be refused, to stop
+    /// anyone voiding a round while the reveal was merely late - but past the
+    /// window a reveal is no longer possible, so rolling over is the only way
+    /// forward, and it takes nothing from anyone.
     RolloverRound { round_id: u64 },
 
+    /// Admin: any field. Operator: only min_entries, min_pot and paused -
+    /// changes that affect future rounds only, since every round freezes its
+    /// terms at open.
     UpdateConfig {
         admin: Option<String>,
+        operator: Option<String>,
         nft_contract: Option<String>,
         treasury: Option<String>,
         treasury_bps: Option<u64>,
@@ -120,8 +130,19 @@ pub enum ExecuteMsg {
     },
 }
 
+/// Every field optional, so `{}` still migrates. On the first migration to
+/// this version the operator defaults to the current admin - on the live pools
+/// that is the automation key - before `admin` is replaced.
 #[cw_serde]
-pub struct MigrateMsg {}
+#[derive(Default)]
+pub struct MigrateMsg {
+    #[serde(default)]
+    pub admin: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub stale_after_secs: Option<u64>,
+}
 
 #[cw_serde]
 #[derive(QueryResponses)]
@@ -148,6 +169,7 @@ pub enum QueryMsg {
 #[cw_serde]
 pub struct ConfigResponse {
     pub admin: String,
+    pub operator: String,
     pub nft_contract: String,
     pub denom: String,
     pub treasury: String,

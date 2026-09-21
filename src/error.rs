@@ -45,8 +45,11 @@ pub enum ContractError {
     #[error("round {round_id} is not stale yet: rollover opens {secs}s after close_time")]
     NotStale { round_id: u64, secs: u64 },
 
-    #[error("round {round_id} has entries and a pot: settle it with SettleStale, not RolloverRound")]
-    RoundIsDrawable { round_id: u64 },
+    #[error("round {round_id}: the reveal window has closed - roll it over with RolloverRound")]
+    RevealWindowClosed { round_id: u64 },
+
+    #[error("the new round must close after the previous round's reveal deadline ({deadline})")]
+    CloseBeforeRevealDeadline { deadline: u64 },
 
     #[error("round {round_id} is already closed: free entries must be recorded before it closes")]
     FreeEntriesClosed { round_id: u64 },

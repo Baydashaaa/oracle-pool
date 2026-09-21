@@ -13,8 +13,8 @@ use crate::msg::{
     MigrateMsg, PotResponse, ProofResponse, QueryMsg, RoundResponse, RoundsResponse,
 };
 use crate::state::{
-    Config, Entry, Round, RoundStatus, CARRY, CONFIG, ENTRIES, LAST_ROUND_ID, NEXT_ENTRY_ID,
-    NEXT_UNSETTLED_ID, ROUNDS,
+    Config, Entry, Round, RoundStatus, RoundTerms, CARRY, CONFIG, ENTRIES, LAST_ROUND_ID,
+    NEXT_ENTRY_ID, NEXT_UNSETTLED_ID, ROUNDS,
 };
 
 const CONTRACT_NAME: &str = "crates.io:oracle-pool";
@@ -57,7 +57,27 @@ fn check_bps(cfg: &Config) -> Result<(), ContractError> {
             reason: "payout_bps must have at least one place".into(),
         });
     }
+    if cfg.stale_after_secs == 0 {
+        return Err(ContractError::InvalidConfig {
+            reason: "stale_after_secs (the reveal window) must be positive".into(),
+        });
+    }
     Ok(())
+}
+
+/// The automation key. Configs written before the split have none, and then
+/// the admin acts as operator too.
+fn operator_of(cfg: &Config) -> &Addr {
+    cfg.operator.as_ref().unwrap_or(&cfg.admin)
+}
+
+/// Terms the round was opened under, or the live config for rounds opened
+/// before terms were recorded.
+fn terms_for(cfg: &Config, round: &Round) -> RoundTerms {
+    round
+        .terms
+        .clone()
+        .unwrap_or_else(|| RoundTerms::from_config(cfg))
 }
 
 /// cw721 owner_of, trimmed to the one field we need.
@@ -241,6 +261,10 @@ pub fn instantiate(
         min_pot: msg.min_pot,
         stale_after_secs: msg.stale_after_secs,
         paused: false,
+        operator: match msg.operator {
+            Some(v) => Some(deps.api.addr_validate(&v)?),
+            None => None,
+        },
     };
     check_bps(&cfg)?;
     CONFIG.save(deps.storage, &cfg)?;
@@ -264,6 +288,7 @@ pub fn instantiate(
             pot: None,
             settled_at: None,
             has_late_entries: false,
+            terms: Some(RoundTerms::from_config(&cfg)),
         },
     )?;
     NEXT_ENTRY_ID.save(deps.storage, &1u64)?;
@@ -278,9 +303,33 @@ pub fn instantiate(
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
+    let mut cfg = CONFIG.load(deps.storage)?;
+
+    // Before the split one key did both jobs, and on the live pools that key
+    // is the automation's. It stays on as operator - set BEFORE the admin is
+    // replaced below, or the automation would silently lose its role.
+    if cfg.operator.is_none() {
+        cfg.operator = Some(cfg.admin.clone());
+    }
+    if let Some(v) = msg.operator {
+        cfg.operator = Some(deps.api.addr_validate(&v)?);
+    }
+    if let Some(v) = msg.admin {
+        cfg.admin = deps.api.addr_validate(&v)?;
+    }
+    if let Some(v) = msg.stale_after_secs {
+        cfg.stale_after_secs = v;
+    }
+    check_bps(&cfg)?;
+    CONFIG.save(deps.storage, &cfg)?;
+
     cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-    Ok(Response::new().add_attribute("action", "migrate"))
+    Ok(Response::new()
+        .add_attribute("action", "migrate")
+        .add_attribute("admin", cfg.admin.to_string())
+        .add_attribute("operator", operator_of(&cfg).to_string())
+        .add_attribute("stale_after_secs", cfg.stale_after_secs.to_string()))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -304,9 +353,11 @@ pub fn execute(
             close_time,
         } => open_round(deps, env, info, seed_hash, close_time),
         ExecuteMsg::ExecuteDraw { round_id, secret } => {
-            execute_draw(deps, env, info, round_id, Some(secret))
+            execute_draw(deps, env, info, round_id, secret)
         }
-        ExecuteMsg::SettleStale { round_id } => execute_draw(deps, env, info, round_id, None),
+        // Раньше разыгрывал раунд второй формулой без секрета. Теперь это
+        // тот же перенос - см. SEC-03 в msg.rs.
+        ExecuteMsg::SettleStale { round_id } => rollover_round(deps, env, round_id),
         ExecuteMsg::RolloverRound { round_id } => rollover_round(deps, env, round_id),
         ExecuteMsg::UpdateConfig { .. } => update_config(deps, info, msg),
     }
@@ -371,7 +422,7 @@ fn record_free_entries(
     items: Vec<FreeEntryItem>,
 ) -> Result<Response, ContractError> {
     let cfg = CONFIG.load(deps.storage)?;
-    if info.sender != cfg.admin {
+    if info.sender != *operator_of(&cfg) {
         return Err(ContractError::Unauthorized {});
     }
     if cfg.paused {
@@ -443,7 +494,7 @@ fn open_round(
     close_time: Timestamp,
 ) -> Result<Response, ContractError> {
     let cfg = CONFIG.load(deps.storage)?;
-    if info.sender != cfg.admin {
+    if info.sender != *operator_of(&cfg) {
         return Err(ContractError::Unauthorized {});
     }
     if seed_hash.len() != 32 {
@@ -460,6 +511,18 @@ fn open_round(
     if close_time <= last.close_time {
         return Err(ContractError::CloseTimeNotAfterPrevious {
             previous: last.close_time.seconds(),
+        });
+    }
+    // Новый раунд обязан закрыться ПОСЛЕ срока раскрытия предыдущего. Тогда
+    // в момент этого срока он ещё принимает входы, и исход, в который ушёл бы
+    // нераскрытый раунд, зависит от минтов, которых ещё нет. Без этого
+    // держатель секрета мог бы дождаться закрытия и выбрать выгодный исход.
+    let deadline = last
+        .close_time
+        .plus_seconds(terms_for(&cfg, &last).stale_after_secs);
+    if close_time <= deadline {
+        return Err(ContractError::CloseBeforeRevealDeadline {
+            deadline: deadline.seconds(),
         });
     }
 
@@ -483,6 +546,9 @@ fn open_round(
             pot: None,
             settled_at: None,
             has_late_entries: false,
+            // Условия замораживаются здесь. Всё, что расчёт возьмёт потом,
+            // берётся отсюда, а не из конфига на момент выплаты (SEC-04).
+            terms: Some(RoundTerms::from_config(&cfg)),
         },
     )?;
     LAST_ROUND_ID.save(deps.storage, &id)?;
@@ -518,37 +584,27 @@ fn check_settleable(
     Ok(round)
 }
 
-/// `secret = None` is the stale path: the round is settled without a reveal,
-/// which is only allowed once it has gone stale.
 fn execute_draw(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
     round_id: u64,
-    secret: Option<Binary>,
+    secret: Binary,
 ) -> Result<Response, ContractError> {
     let cfg = CONFIG.load(deps.storage)?;
     let mut round = check_settleable(deps.storage, &env, round_id)?;
+    // Условия, под которыми раунд открывался, а не текущий конфиг (SEC-04).
+    let terms = terms_for(&cfg, &round);
 
-    match &secret {
-        Some(s) => {
-            if sha256(&[s.as_slice()]).as_slice() != round.seed_hash.as_slice() {
-                return Err(ContractError::SecretMismatch {});
-            }
-        }
-        None => {
-            // Запасной путь открывается только после того, как раскрыть уже
-            // было пора. Раньше срока он превратил бы себя в способ обойти
-            // фиксацию: посторонний считал бы исход и вызывал бы тот, что
-            // ему выгоднее.
-            let opens_at = round.close_time.plus_seconds(cfg.stale_after_secs);
-            if env.block.time < opens_at {
-                return Err(ContractError::NotStale {
-                    round_id,
-                    secs: cfg.stale_after_secs,
-                });
-            }
-        }
+    // Срок раскрытия обязателен (SEC-03). После него раунд можно только
+    // перенести: иначе держатель секрета дождался бы закрытия следующего
+    // раунда, посчитал оба исхода и выбрал бы выгодный.
+    let deadline = round.close_time.plus_seconds(terms.stale_after_secs);
+    if env.block.time >= deadline {
+        return Err(ContractError::RevealWindowClosed { round_id });
+    }
+    if sha256(&[secret.as_slice()]).as_slice() != round.seed_hash.as_slice() {
+        return Err(ContractError::SecretMismatch {});
     }
 
     let scan = scan_round(deps.storage, round_id, &round)?;
@@ -573,14 +629,12 @@ fn execute_draw(
     round.entropy = Some(scan.entropy.clone());
     round.total_entries = Some(scan.total_entries);
     round.has_late_entries = scan.has_late_entries;
-    // На запасном пути остаётся None - по этому полю раунд, посчитанный без
-    // раскрытия, отличается от обычного и в состоянии, и в зеркале.
-    round.secret = secret.clone();
+    round.secret = Some(secret.clone());
     round.settled_at = Some(env.block.time);
 
     // Not enough of a round to run: consume nothing, leave the boundary where
     // it was, and the entries simply belong to the next round.
-    if scan.total_entries < cfg.min_entries || pot < cfg.min_pot {
+    if scan.total_entries < terms.min_entries || pot < terms.min_pot {
         round.status = RoundStatus::Skipped;
         round.last_entry_id = Some(scan.first_entry_id - 1);
         ROUNDS.save(deps.storage, round_id, &round)?;
@@ -601,28 +655,19 @@ fn execute_draw(
             .add_attribute("pot", pot));
     }
 
-    // Обычный путь берёт раскрытый секрет. Запасной - метку схемы и seed_hash
-    // вместо него: и то, и другое зафиксировано до закрытия приёма, поэтому
-    // исход одинаков при любом моменте вызова и считается публично.
-    let result = match &secret {
-        Some(s) => sha256(&[
-            s.as_slice(),
-            scan.entropy.as_slice(),
-            &round_id.to_be_bytes(),
-        ]),
-        None => sha256(&[
-            b"oracle-pool:stale",
-            scan.entropy.as_slice(),
-            &round_id.to_be_bytes(),
-            round.seed_hash.as_slice(),
-        ]),
-    };
+    // Одна формула. Вторая, без секрета, давала держателю секрета выбор между
+    // двумя известными исходами и убрана (SEC-03).
+    let result = sha256(&[
+        secret.as_slice(),
+        scan.entropy.as_slice(),
+        &round_id.to_be_bytes(),
+    ]);
 
     // Distinct winners are picked by minter, not by current owner: the owner
     // costs a query per candidate, the minter is already in storage. Someone
     // minting from two wallets can therefore take two places — stated plainly
     // rather than paid for with a loop of queries.
-    let places = (cfg.payout_bps.len() as u64).min(scan.total_entries);
+    let places = (terms.payout_bps.len() as u64).min(scan.total_entries);
     let mut winner_indexes: Vec<u64> = vec![];
     let mut winner_minters: Vec<Addr> = vec![];
     let mut winner_tokens: Vec<String> = vec![];
@@ -660,6 +705,7 @@ fn execute_draw(
     let mut msgs: Vec<BankMsg> = vec![];
     let mut winners: Vec<Addr> = vec![];
     let mut paid = Uint128::zero();
+    let mut paid_to_minter: Vec<String> = vec![];
 
     for (i, token_id) in winner_tokens.iter().enumerate() {
         // У бесплатного билета токена нет, спрашивать владельца не у кого:
@@ -667,9 +713,21 @@ fn execute_draw(
         let owner = if token_id.starts_with(FREE_PREFIX) {
             winner_minters[i].clone()
         } else {
-            token_owner(deps.as_ref(), &cfg.nft_contract, token_id)?
+            // Если владельца узнать нельзя - токен сожжён (контракт масок
+            // сохраняет стандартный Burn) или контракт масок не отвечает, -
+            // платим минтеру. Раньше здесь стоял `?`: ошибка валила весь
+            // расчёт, а расчёт идёт строго по порядку, так что один
+            // сожжённый токен навсегда останавливал ВСЕ следующие раунды
+            // (SEC-05). Вход был оплачен честно, приз не должен пропасть.
+            match token_owner(deps.as_ref(), &terms.nft_contract, token_id) {
+                Ok(o) => o,
+                Err(_) => {
+                    paid_to_minter.push((i + 1).to_string());
+                    winner_minters[i].clone()
+                }
+            }
         };
-        let amount = bps(pot, cfg.payout_bps[i]);
+        let amount = bps(pot, terms.payout_bps[i]);
         if !amount.is_zero() {
             msgs.push(BankMsg::Send {
                 to_address: owner.to_string(),
@@ -680,16 +738,16 @@ fn execute_draw(
         winners.push(owner);
     }
 
-    let to_treasury = bps(pot, cfg.treasury_bps);
+    let to_treasury = bps(pot, terms.treasury_bps);
     if !to_treasury.is_zero() {
         msgs.push(BankMsg::Send {
-            to_address: cfg.treasury.to_string(),
+            to_address: terms.treasury.to_string(),
             amount: coins(to_treasury.u128(), &cfg.denom),
         });
         paid += to_treasury;
     }
 
-    let to_caller = bps(pot, cfg.caller_bps);
+    let to_caller = bps(pot, terms.caller_bps);
     if !to_caller.is_zero() {
         msgs.push(BankMsg::Send {
             to_address: info.sender.to_string(),
@@ -711,12 +769,9 @@ fn execute_draw(
     // than carried into the next round.
     CARRY.save(deps.storage, &available.saturating_sub(paid))?;
 
-    Ok(Response::new()
+    let mut resp = Response::new()
         .add_messages(msgs)
-        .add_attribute(
-            "action",
-            if secret.is_some() { "execute_draw" } else { "settle_stale" },
-        )
+        .add_attribute("action", "execute_draw")
         .add_attribute("round_id", round_id.to_string())
         .add_attribute("entries", scan.total_entries.to_string())
         .add_attribute("pot", pot)
@@ -737,36 +792,42 @@ fn execute_draw(
                 .map(|w| w.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-        ))
+        );
+    // Видно в событиях, когда приз ушёл минтеру вместо владельца.
+    if !paid_to_minter.is_empty() {
+        resp = resp.add_attribute("paid_to_minter_places", paid_to_minter.join(","));
+    }
+    Ok(resp)
 }
 
 fn rollover_round(deps: DepsMut, env: Env, round_id: u64) -> Result<Response, ContractError> {
     let cfg = CONFIG.load(deps.storage)?;
     let mut round = check_settleable(deps.storage, &env, round_id)?;
+    let terms = terms_for(&cfg, &round);
 
-    let opens_at = round.close_time.plus_seconds(cfg.stale_after_secs);
+    // Открывается ровно тогда, когда закрывается окно раскрытия: секунда в
+    // секунду, без перекрытия, чтобы в одно мгновение не были доступны и
+    // раскрытие, и перенос.
+    let opens_at = round.close_time.plus_seconds(terms.stale_after_secs);
     if env.block.time < opens_at {
         return Err(ContractError::NotStale {
             round_id,
-            secs: cfg.stale_after_secs,
+            secs: terms.stale_after_secs,
         });
     }
 
-    // Раунд, который можно разыграть, здесь больше не отменяется: для него
-    // есть SettleStale. Иначе посторонний мог бы обнулить раунд с билетами и
-    // призом, просто дождавшись, пока раскрытие задержится.
+    // Переносится и раунд, который можно было разыграть. Раньше это
+    // запрещалось, чтобы посторонний не обнулил раунд при опоздавшем
+    // раскрытии. Но после срока раскрыть уже нельзя, перенос - единственный
+    // путь, и он ничего ни у кого не отнимает: входы и деньги уходят в
+    // следующий раунд целиком.
     let scan = scan_round(deps.storage, round_id, &round)?;
-    let carry = CARRY.load(deps.storage)?;
     let balance = deps
         .querier
         .query_balance(env.contract.address.clone(), &cfg.denom)?
         .amount;
     let reserved = reserved_after(deps.storage, scan.last_entry_id)?;
     let available = balance.saturating_sub(reserved);
-    let pot = (scan.amount + carry).min(available);
-    if scan.total_entries >= cfg.min_entries && pot >= cfg.min_pot {
-        return Err(ContractError::RoundIsDrawable { round_id });
-    }
 
     let first = first_entry_of(deps.storage, round_id)?;
     round.status = RoundStatus::RolledOver;
@@ -791,6 +852,7 @@ fn update_config(
 ) -> Result<Response, ContractError> {
     let ExecuteMsg::UpdateConfig {
         admin,
+        operator,
         nft_contract,
         treasury,
         treasury_bps,
@@ -806,11 +868,33 @@ fn update_config(
     };
 
     let mut cfg = CONFIG.load(deps.storage)?;
-    if info.sender != cfg.admin {
+    let is_admin = info.sender == cfg.admin;
+    let is_operator = info.sender == *operator_of(&cfg);
+    if !is_admin && !is_operator {
+        return Err(ContractError::Unauthorized {});
+    }
+    // Оператор - горячий ключ автоматики. Ему можно только пороги и паузу:
+    // они действуют на будущие раунды, потому что каждый раунд замораживает
+    // условия при открытии. Казна, доли, контракт масок, окно раскрытия и
+    // сами роли - только админу. Раньше всё это умел один ключ из CI, и
+    // утечка его давала угнать пот при следующем расчёте (SEC-04).
+    if !is_admin
+        && (admin.is_some()
+            || operator.is_some()
+            || nft_contract.is_some()
+            || treasury.is_some()
+            || treasury_bps.is_some()
+            || payout_bps.is_some()
+            || caller_bps.is_some()
+            || stale_after_secs.is_some())
+    {
         return Err(ContractError::Unauthorized {});
     }
     if let Some(v) = admin {
         cfg.admin = deps.api.addr_validate(&v)?;
+    }
+    if let Some(v) = operator {
+        cfg.operator = Some(deps.api.addr_validate(&v)?);
     }
     if let Some(v) = nft_contract {
         cfg.nft_contract = deps.api.addr_validate(&v)?;
@@ -870,6 +954,7 @@ fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
     let c = CONFIG.load(deps.storage)?;
     Ok(ConfigResponse {
         admin: c.admin.to_string(),
+        operator: operator_of(&c).to_string(),
         nft_contract: c.nft_contract.to_string(),
         denom: c.denom,
         treasury: c.treasury.to_string(),

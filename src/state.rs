@@ -13,6 +13,15 @@ pub struct Config {
     /// Opens rounds and edits config. Cannot influence an outcome: the seed is
     /// committed before the entries exist, and the entropy comes from minters.
     pub admin: Addr,
+    /// Hot key for automation: opens rounds, records free entries, and may
+    /// adjust min_entries, min_pot and paused. It cannot touch payouts, the
+    /// treasury, the NFT contract, the reveal window or the roles - those are
+    /// admin only (SEC-04). Before, one key did both, and it lived in CI.
+    ///
+    /// None on configs written before the split; then the admin acts as
+    /// operator too. Migration fills it in.
+    #[serde(default)]
+    pub operator: Option<Addr>,
     /// The only address allowed to call RecordEntry — the NFT contract.
     pub nft_contract: Addr,
     pub denom: String,
@@ -28,9 +37,16 @@ pub struct Config {
     pub min_entries: u64,
     /// Below this pot the round is skipped too. Zero disables the check.
     pub min_pot: Uint128,
-    /// How long past close_time an unrevealed round may be rolled over by
-    /// anyone. The valve that keeps funds from being trapped if the master
-    /// key is ever lost.
+    /// Reveal window. The secret must be revealed within this many seconds
+    /// of close_time; after that ExecuteDraw is refused and the round can
+    /// only be rolled over, by anyone.
+    ///
+    /// Binding on purpose (SEC-03). If the reveal were allowed forever, the
+    /// holder of the secret could wait until the NEXT round closed, work out
+    /// both outcomes - reveal now, or let it roll into the next round - and
+    /// pick. OpenRound also requires the next round to close after this
+    /// window, so at the deadline the alternative still depends on entries
+    /// nobody has made yet: withholding becomes a blind bet, not a choice.
     pub stale_after_secs: u64,
     /// Stops RecordEntry only. Never stops ExecuteDraw or RolloverRound:
     /// pausing must not be able to trap money that is already in.
@@ -105,6 +121,40 @@ pub struct Round {
     /// next. The commitment is then younger than those entries, so the round
     /// says so out loud instead of hiding it.
     pub has_late_entries: bool,
+    /// Conditions this round was opened under. Settlement reads these, not
+    /// the live config, so changing the config cannot redirect a round that
+    /// is already taking entries (SEC-04). None for rounds opened before
+    /// terms existed: those settle under the live config, as they always did.
+    #[serde(default)]
+    pub terms: Option<RoundTerms>,
+}
+
+/// Everything settlement needs that an admin could otherwise change midway.
+#[cw_serde]
+pub struct RoundTerms {
+    pub nft_contract: Addr,
+    pub treasury: Addr,
+    pub treasury_bps: u64,
+    pub payout_bps: Vec<u64>,
+    pub caller_bps: u64,
+    pub min_entries: u64,
+    pub min_pot: Uint128,
+    pub stale_after_secs: u64,
+}
+
+impl RoundTerms {
+    pub fn from_config(c: &Config) -> Self {
+        RoundTerms {
+            nft_contract: c.nft_contract.clone(),
+            treasury: c.treasury.clone(),
+            treasury_bps: c.treasury_bps,
+            payout_bps: c.payout_bps.clone(),
+            caller_bps: c.caller_bps,
+            min_entries: c.min_entries,
+            min_pot: c.min_pot,
+            stale_after_secs: c.stale_after_secs,
+        }
+    }
 }
 
 pub const CONFIG: Item<Config> = Item::new("config");

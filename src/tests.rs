@@ -7,7 +7,8 @@ use cosmwasm_std::{
 use crate::contract::{execute, instantiate, query};
 use crate::error::ContractError;
 use crate::msg::{
-    ExecuteMsg, FreeEntryItem, InstantiateMsg, PotResponse, QueryMsg, RoundResponse,
+    ConfigResponse, ExecuteMsg, FreeEntryItem, InstantiateMsg, MigrateMsg, PotResponse,
+    QueryMsg, RoundResponse,
 };
 use crate::state::RoundStatus;
 
@@ -72,7 +73,10 @@ fn init(deps: cosmwasm_std::DepsMut, payout: Vec<u64>, min_entries: u64) {
             caller_bps: 10,
             min_entries,
             min_pot: Uint128::zero(),
-            stale_after_secs: 14 * 24 * HOUR,
+            // Боевое значение: 6 часов. Меньше суток, поэтому daily-раунды
+            // через 24 часа проходят проверку OpenRound.
+            stale_after_secs: 6 * HOUR,
+            operator: None,
             first_seed_hash: hash(secret_of(1).as_slice()),
             first_close_time: env.block.time.plus_seconds(24 * HOUR),
         },
@@ -348,9 +352,11 @@ fn entries_after_close_belong_to_the_next_round() {
     // arrives one second after close_time
     record(deps.as_mut(), at(24 * HOUR + 1), "bob", 1, "common-2");
 
+    // Внутри окна раскрытия: ровно на 30-м часу (закрытие + 6) оно уже
+    // закрыто. Тест не про срок, а про поздний минт.
     execute(
         deps.as_mut(),
-        at(30 * HOUR),
+        at(29 * HOUR),
         mock_info("anyone", &[]),
         ExecuteMsg::ExecuteDraw {
             round_id: 1,
@@ -359,7 +365,7 @@ fn entries_after_close_belong_to_the_next_round() {
     )
     .unwrap();
 
-    let r = round(deps.as_ref(), at(30 * HOUR), 1);
+    let r = round(deps.as_ref(), at(29 * HOUR), 1);
     assert_eq!(r.total_entries, Some(1), "the late mint must not join round 1");
     assert_eq!(r.last_entry_id, Some(1));
 }
@@ -405,22 +411,24 @@ fn pot_never_exceeds_the_balance() {
     );
 }
 
-/// Перенос больше не отменяет раунд, который можно разыграть. Раньше это был
-/// открытый путь для постороннего: дождаться, пока раскрытие задержится, и
-/// обнулить раунд с билетами и призом.
+/// SEC-03: раунд, который можно было разыграть, после окна раскрытия тоже
+/// переносится. Раскрыть его уже нельзя, так что перенос - единственный путь,
+/// и он ничего не отнимает: входы и деньги уходят в следующий раунд целиком.
 #[test]
-fn rollover_refuses_a_drawable_round() {
+fn a_stale_round_rolls_over_even_if_it_could_be_drawn() {
     let mut deps = deps_with_owner!("alice");
     init(deps.as_mut(), vec![8000], 5);
     record(deps.as_mut(), at(10), "alice", 5, "common-1");
-    let err = execute(
+    execute(
         deps.as_mut(),
-        at(24 * HOUR + 15 * 24 * HOUR),
+        at(24 * HOUR + 6 * HOUR),
         mock_info("anyone", &[]),
         ExecuteMsg::RolloverRound { round_id: 1 },
     )
-    .unwrap_err();
-    assert!(matches!(err, ContractError::RoundIsDrawable { round_id: 1 }));
+    .unwrap();
+    let r = round(deps.as_ref(), at(24 * HOUR + 6 * HOUR), 1);
+    assert_eq!(r.status, RoundStatus::RolledOver);
+    assert!(r.winners.is_empty(), "перенос никого не награждает");
 }
 
 /// Запасной путь открывается только после того, как раскрыть было пора.
@@ -441,73 +449,139 @@ fn stale_settlement_needs_the_round_to_be_stale() {
     assert!(matches!(err, ContractError::NotStale { .. }));
 }
 
-/// Главное свойство схемы: момент вызова на исход не влияет. Всё, из чего
-/// считается запасной результат, зафиксировано к закрытию приёма, поэтому
-/// перебирать блоки в поисках удобного ответа бесполезно.
+/// SEC-03: SettleStale больше не разыгрывает раунд второй формулой. Та
+/// формула давала держателю секрета два известных исхода на выбор. Теперь
+/// это перенос, как RolloverRound, и розыгрыша без секрета не бывает.
 #[test]
-fn stale_settlement_is_the_same_whenever_it_is_called() {
-    fn settle_at(offset: u64) -> RoundResponse {
-        let mut deps = deps_with_owner!("alice");
-        init(deps.as_mut(), vec![8000], 1);
-        record(deps.as_mut(), at(10), "alice", 3, "common-1");
-        record(deps.as_mut(), at(20), "bob", 2, "common-2");
-        execute(
-            deps.as_mut(),
-            at(offset),
-            mock_info("anyone", &[]),
-            ExecuteMsg::SettleStale { round_id: 1 },
-        )
-        .unwrap();
-        round(deps.as_ref(), at(offset), 1)
-    }
-
-    let early = settle_at(24 * HOUR + 15 * 24 * HOUR);
-    let late = settle_at(24 * HOUR + 40 * 24 * HOUR);
-    assert_eq!(early.result, late.result, "результат не должен зависеть от момента вызова");
-    assert_eq!(early.winner_indexes, late.winner_indexes);
-    assert_eq!(early.status, RoundStatus::Drawn);
+fn settle_stale_now_rolls_over_instead_of_drawing() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 3, "common-1");
+    record(deps.as_mut(), at(20), "bob", 2, "common-2");
+    execute(
+        deps.as_mut(),
+        at(24 * HOUR + 6 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::SettleStale { round_id: 1 },
+    )
+    .unwrap();
+    let r = round(deps.as_ref(), at(24 * HOUR + 6 * HOUR), 1);
+    assert_eq!(r.status, RoundStatus::RolledOver);
+    assert!(r.result.is_none(), "без секрета результата нет");
+    assert!(r.winners.is_empty());
 }
 
-/// Раунд, посчитанный без раскрытия, отличим от обычного: секрета в нём нет.
-/// По этому полю его помечает зеркало, а человек видит в истории.
+/// Перенесённые входы не теряются: следующий раунд разыгрывает их вместе со
+/// своими, по своему секрету.
 #[test]
-fn stale_settlement_records_no_secret() {
+fn rolled_over_entries_are_drawn_in_the_next_round() {
     let mut deps = deps_with_owner!("alice");
     init(deps.as_mut(), vec![8000], 1);
     record(deps.as_mut(), at(10), "alice", 5, "common-1");
     execute(
         deps.as_mut(),
-        at(24 * HOUR + 15 * 24 * HOUR),
-        mock_info("anyone", &[]),
-        ExecuteMsg::SettleStale { round_id: 1 },
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::OpenRound {
+            seed_hash: hash(secret_of(2).as_slice()),
+            close_time: mock_env().block.time.plus_seconds(48 * HOUR),
+        },
     )
     .unwrap();
-    let r = round(deps.as_ref(), at(24 * HOUR + 15 * 24 * HOUR), 1);
-    assert_eq!(r.status, RoundStatus::Drawn);
-    assert!(r.secret.is_none(), "запасной расчёт не должен записывать секрет");
-    assert!(r.result.is_some());
-    assert_eq!(r.total_entries, Some(5));
+    execute(
+        deps.as_mut(),
+        at(24 * HOUR + 6 * HOUR),
+        mock_info("anyone", &[]),
+        ExecuteMsg::RolloverRound { round_id: 1 },
+    )
+    .unwrap();
+    execute(
+        deps.as_mut(),
+        at(48 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 2, secret: secret_of(2) },
+    )
+    .unwrap();
+    let r2 = round(deps.as_ref(), at(48 * HOUR + 2), 2);
+    assert_eq!(r2.status, RoundStatus::Drawn);
+    assert_eq!(r2.total_entries, Some(5), "входы раунда 1 разыграны в раунде 2");
 }
 
-/// Запасной результат не совпадает с обычным - иначе знание секрета давало бы
-/// оператору предсказание обоих исходов как одного.
+/// SEC-03: граница окна точная. За секунду до срока можно раскрыть и нельзя
+/// переносить; ровно в срок - наоборот. Нет мгновения, когда доступно и то, и
+/// другое, иначе в это мгновение снова был бы выбор.
 #[test]
-fn stale_result_differs_from_the_revealed_one() {
-    fn settle(stale: bool) -> Binary {
-        let mut deps = deps_with_owner!("alice");
-        init(deps.as_mut(), vec![8000], 1);
-        record(deps.as_mut(), at(10), "alice", 3, "common-1");
-        record(deps.as_mut(), at(20), "bob", 2, "common-2");
-        let when = at(24 * HOUR + 15 * 24 * HOUR);
-        let msg = if stale {
-            ExecuteMsg::SettleStale { round_id: 1 }
-        } else {
-            ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) }
-        };
-        execute(deps.as_mut(), when.clone(), mock_info("anyone", &[]), msg).unwrap();
-        round(deps.as_ref(), when, 1).result.unwrap()
-    }
-    assert_ne!(settle(true), settle(false));
+fn the_reveal_window_boundary_is_exact() {
+    let deadline = 24 * HOUR + 6 * HOUR;
+
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    let err = execute(
+        deps.as_mut(),
+        at(deadline - 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::RolloverRound { round_id: 1 },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::NotStale { .. }));
+    execute(
+        deps.as_mut(),
+        at(deadline - 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+    let err = execute(
+        deps.as_mut(),
+        at(deadline),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::RevealWindowClosed { round_id: 1 }));
+    execute(
+        deps.as_mut(),
+        at(deadline),
+        mock_info("anyone", &[]),
+        ExecuteMsg::RolloverRound { round_id: 1 },
+    )
+    .unwrap();
+}
+
+/// SEC-03: следующий раунд обязан закрыться после срока раскрытия текущего.
+/// Иначе к сроку его входы были бы известны, и держатель секрета снова мог бы
+/// посчитать оба исхода.
+#[test]
+fn next_round_must_close_after_the_reveal_deadline() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    // Раунд 1 закрывается на 24-м часу, срок раскрытия - 30-й.
+    let err = execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::OpenRound {
+            seed_hash: hash(secret_of(2).as_slice()),
+            close_time: mock_env().block.time.plus_seconds(30 * HOUR),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, ContractError::CloseBeforeRevealDeadline { .. }));
+    execute(
+        deps.as_mut(),
+        at(10),
+        mock_info(ADMIN, &[]),
+        ExecuteMsg::OpenRound {
+            seed_hash: hash(secret_of(2).as_slice()),
+            close_time: mock_env().block.time.plus_seconds(30 * HOUR + 1),
+        },
+    )
+    .unwrap();
 }
 
 fn free(deps: cosmwasm_std::DepsMut, env: cosmwasm_std::Env, who: &str, wallet: &str, tickets: u32, tx: &str)
@@ -786,4 +860,295 @@ fn absorbing_does_not_double_count_the_entries() {
         after.pending + after.carry,
         after.balance
     );
+}
+
+
+// ══════════════════ SEC-04 / SEC-05 / миграция ══════════════════
+
+const OPERATOR: &str = "operator";
+
+fn config(deps: cosmwasm_std::Deps) -> ConfigResponse {
+    from_json(query(deps, mock_env(), QueryMsg::Config {}).unwrap()).unwrap()
+}
+
+/// Частичное обновление конфига: всё, что не задано, остаётся None.
+#[derive(Default)]
+struct Upd {
+    admin: Option<String>,
+    operator: Option<String>,
+    nft_contract: Option<String>,
+    treasury: Option<String>,
+    treasury_bps: Option<u64>,
+    payout_bps: Option<Vec<u64>>,
+    caller_bps: Option<u64>,
+    min_entries: Option<u64>,
+    min_pot: Option<Uint128>,
+    stale_after_secs: Option<u64>,
+    paused: Option<bool>,
+}
+
+impl Upd {
+    fn msg(self) -> ExecuteMsg {
+        ExecuteMsg::UpdateConfig {
+            admin: self.admin,
+            operator: self.operator,
+            nft_contract: self.nft_contract,
+            treasury: self.treasury,
+            treasury_bps: self.treasury_bps,
+            payout_bps: self.payout_bps,
+            caller_bps: self.caller_bps,
+            min_entries: self.min_entries,
+            min_pot: self.min_pot,
+            stale_after_secs: self.stale_after_secs,
+            paused: self.paused,
+        }
+    }
+}
+
+fn update(deps: cosmwasm_std::DepsMut, who: &str, u: Upd) -> Result<cosmwasm_std::Response, ContractError> {
+    execute(deps, mock_env(), mock_info(who, &[]), u.msg())
+}
+
+/// Кому ушли деньги в ответе расчёта.
+fn recipients(res: &cosmwasm_std::Response) -> Vec<(String, u128)> {
+    use cosmwasm_std::{BankMsg, CosmosMsg};
+    res.messages
+        .iter()
+        .filter_map(|m| match &m.msg {
+            CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                Some((to_address.clone(), amount[0].amount.u128()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Контракт с отдельным ключом оператора, как будет в проде после миграции.
+fn init_split(deps: cosmwasm_std::DepsMut) {
+    init(deps, vec![8000], 1);
+}
+
+/// SEC-04: оператор - горячий ключ автоматики. Ему нельзя трогать деньги и
+/// роли: казну, доли, контракт масок, окно раскрытия, админа, оператора.
+#[test]
+fn the_operator_cannot_touch_money_or_roles() {
+    let mut deps = deps_with_owner!("alice");
+    init_split(deps.as_mut());
+    update(deps.as_mut(), ADMIN, Upd { operator: Some(OPERATOR.into()), ..Default::default() })
+        .unwrap();
+
+    let forbidden: Vec<Upd> = vec![
+        Upd { treasury: Some("thief".into()), ..Default::default() },
+        Upd { treasury_bps: Some(9000), ..Default::default() },
+        Upd { payout_bps: Some(vec![100]), ..Default::default() },
+        Upd { caller_bps: Some(500), ..Default::default() },
+        Upd { nft_contract: Some("fake_nft".into()), ..Default::default() },
+        Upd { stale_after_secs: Some(30 * 24 * HOUR), ..Default::default() },
+        Upd { admin: Some(OPERATOR.into()), ..Default::default() },
+        Upd { operator: Some("someone".into()), ..Default::default() },
+    ];
+    for u in forbidden {
+        let err = update(deps.as_mut(), OPERATOR, u).unwrap_err();
+        assert!(matches!(err, ContractError::Unauthorized {}));
+    }
+    let c = config(deps.as_ref());
+    assert_eq!(c.treasury, "treasury", "казна не изменилась");
+    assert_eq!(c.admin, ADMIN);
+}
+
+/// SEC-04: пороги и пауза оператору можно - это кнопка set-limits в keeper.
+/// Они действуют только на будущие раунды: каждый раунд замораживает условия.
+#[test]
+fn the_operator_may_set_limits_and_pause() {
+    let mut deps = deps_with_owner!("alice");
+    init_split(deps.as_mut());
+    update(deps.as_mut(), ADMIN, Upd { operator: Some(OPERATOR.into()), ..Default::default() })
+        .unwrap();
+
+    update(
+        deps.as_mut(),
+        OPERATOR,
+        Upd {
+            min_entries: Some(7),
+            min_pot: Some(Uint128::new(123)),
+            paused: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c = config(deps.as_ref());
+    assert_eq!(c.min_entries, 7);
+    assert_eq!(c.min_pot, Uint128::new(123));
+    assert!(c.paused);
+}
+
+/// Посторонний не может ничего - ни как админ, ни как оператор.
+#[test]
+fn a_stranger_cannot_update_config() {
+    let mut deps = deps_with_owner!("alice");
+    init_split(deps.as_mut());
+    let err = update(deps.as_mut(), "stranger", Upd { min_entries: Some(1), ..Default::default() })
+        .unwrap_err();
+    assert!(matches!(err, ContractError::Unauthorized {}));
+}
+
+/// SEC-04: открывать раунды и писать бесплатные билеты может оператор, а
+/// админ после разделения - уже нет. Роли не пересекаются.
+#[test]
+fn only_the_operator_opens_rounds_once_split() {
+    let mut deps = deps_with_owner!("alice");
+    init_split(deps.as_mut());
+    update(deps.as_mut(), ADMIN, Upd { operator: Some(OPERATOR.into()), ..Default::default() })
+        .unwrap();
+    let open = |_who: &str| ExecuteMsg::OpenRound {
+        seed_hash: hash(secret_of(2).as_slice()),
+        close_time: mock_env().block.time.plus_seconds(48 * HOUR),
+    };
+    let err = execute(deps.as_mut(), at(10), mock_info(ADMIN, &[]), open(ADMIN)).unwrap_err();
+    assert!(matches!(err, ContractError::Unauthorized {}));
+    execute(deps.as_mut(), at(10), mock_info(OPERATOR, &[]), open(OPERATOR)).unwrap();
+}
+
+/// SEC-04: условия замораживаются при открытии. Смена казны и долей после
+/// того, как раунд начал принимать входы, на его расчёт не действует. Раньше
+/// расчёт читал конфиг в момент выплаты, и смена казны перенаправляла пот.
+#[test]
+fn round_terms_are_frozen_at_open() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+
+    update(
+        deps.as_mut(),
+        ADMIN,
+        Upd {
+            treasury: Some("thief".into()),
+            treasury_bps: Some(3000),
+            payout_bps: Some(vec![6000]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+    let paid = recipients(&res);
+    assert!(paid.iter().any(|(to, _)| to == "treasury"), "казна раунда - прежняя");
+    assert!(!paid.iter().any(|(to, _)| to == "thief"), "новая казна на этот раунд не действует");
+
+    // Доли тоже прежние: 80% победителю и 10% в казну от пота.
+    let pot = round(deps.as_ref(), at(24 * HOUR + 2), 1).pot.unwrap().u128();
+    let to_alice: u128 = paid.iter().filter(|(to, _)| to == "alice").map(|(_, a)| a).sum();
+    let to_treasury: u128 = paid.iter().filter(|(to, _)| to == "treasury").map(|(_, a)| a).sum();
+    assert_eq!(to_alice, pot * 8000 / 10_000);
+    assert_eq!(to_treasury, pot * 1000 / 10_000);
+}
+
+/// SEC-05: если владельца токена узнать нельзя - маску сожгли, контракт
+/// масок сохраняет стандартный Burn, - приз уходит минтеру, а расчёт не
+/// падает. Раньше ошибка валила расчёт, и раз он идёт строго по порядку,
+/// один сожжённый токен навсегда останавливал все следующие раунды.
+#[test]
+fn a_burned_token_pays_the_minter_instead_of_halting() {
+    let mut deps = mock_dependencies();
+    let mut q = MockQuerier::new(&[]);
+    q.update_wasm(|_| SystemResult::Ok(ContractResult::Err("token not found".into())));
+    deps.querier = q;
+    deps.querier.update_balance(
+        mock_env().contract.address,
+        vec![cosmwasm_std::coin(1_000_000_000_000u128, DENOM)],
+    );
+
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+
+    let res = execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .expect("расчёт не должен падать из-за недоступного владельца");
+
+    assert!(recipients(&res).iter().any(|(to, _)| to == "alice"), "приз ушёл минтеру");
+    assert!(res
+        .attributes
+        .iter()
+        .any(|a| a.key == "paid_to_minter_places" && a.value == "1"));
+    let r = round(deps.as_ref(), at(24 * HOUR + 2), 1);
+    assert_eq!(r.status, RoundStatus::Drawn);
+}
+
+/// Миграция: данные в живом контракте старого формата - в конфиге нет поля
+/// operator, в раундах нет terms. Проверяем на именно таких байтах, а не на
+/// свежем экземпляре: иначе тест прошёл бы, а миграция упала бы в цепочке.
+#[test]
+fn migration_reads_old_data_and_splits_the_roles() {
+    use cosmwasm_std::Storage;
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    record(deps.as_mut(), at(10), "alice", 5, "common-1");
+
+    // Переписываем хранилище в формат до выпуска: без operator и без terms.
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&deps.storage.get(b"config").unwrap()).unwrap();
+    cfg.as_object_mut().unwrap().remove("operator");
+    deps.storage.set(b"config", &serde_json::to_vec(&cfg).unwrap());
+
+    let key = {
+        let mut k = vec![0u8, 6];
+        k.extend_from_slice(b"rounds");
+        k.extend_from_slice(&1u64.to_be_bytes());
+        k
+    };
+    let mut r1: serde_json::Value =
+        serde_json::from_slice(&deps.storage.get(&key).unwrap()).unwrap();
+    r1.as_object_mut().unwrap().remove("terms");
+    deps.storage.set(&key, &serde_json::to_vec(&r1).unwrap());
+
+    // Как на цепочке: admin станет холодным ключом, прежний admin - оператором.
+    crate::contract::migrate(
+        deps.as_mut(),
+        mock_env(),
+        MigrateMsg {
+            admin: Some("cold".into()),
+            operator: None,
+            stale_after_secs: Some(6 * HOUR),
+        },
+    )
+    .unwrap();
+
+    let c = config(deps.as_ref());
+    assert_eq!(c.admin, "cold");
+    assert_eq!(c.operator, ADMIN, "прежний admin остался оператором");
+    assert_eq!(c.stale_after_secs, 6 * HOUR);
+
+    // Раунд без terms, открытый до выпуска, рассчитывается по живому конфигу.
+    let res = execute(
+        deps.as_mut(),
+        at(24 * HOUR + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::ExecuteDraw { round_id: 1, secret: secret_of(1) },
+    )
+    .unwrap();
+    assert!(recipients(&res).iter().any(|(to, _)| to == "alice"));
+
+    // Роли разошлись: оператор больше не трогает казну, холодный ключ - может.
+    assert!(update(deps.as_mut(), ADMIN, Upd { treasury: Some("new_treasury".into()), ..Default::default() }).is_err());
+    update(deps.as_mut(), "cold", Upd { treasury: Some("new_treasury".into()), ..Default::default() }).unwrap();
+}
+
+/// Пустой `{}` по-прежнему мигрирует: ни одно поле MigrateMsg не обязательно.
+#[test]
+fn an_empty_migrate_message_still_works() {
+    let mut deps = deps_with_owner!("alice");
+    init(deps.as_mut(), vec![8000], 1);
+    let m: MigrateMsg = from_json(b"{}").unwrap();
+    crate::contract::migrate(deps.as_mut(), mock_env(), m).unwrap();
+    assert_eq!(config(deps.as_ref()).operator, ADMIN);
 }
